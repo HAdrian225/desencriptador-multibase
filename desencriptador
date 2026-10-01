@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Menú para limpiar (quitar repetidos) y decodificar archivos en base64, base32, base58, hexadecimal o ROT13.
+set -uo pipefail
+
+ALFABETO58="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+# Palabras comunes (español/inglés) para reconocer texto descifrado con ROT13
+PALABRAS='el|la|de|que|es|un|una|en|los|las|por|con|para|este|esta|texto|mensaje|clave|the|is|an|and|of|to|in|this|that|key|secure|message'
+
+archivo=""
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+# Pide un archivo hasta que exista (o el usuario cancele con Enter vacío si ya había uno)
+elegir_archivo() {
+    local ruta
+    while true; do
+        read -r -e -p "Ruta del archivo a desencriptar: " ruta || exit 0
+        # Quitar comillas si se pegó la ruta entre comillas
+        ruta="${ruta%\"}"; ruta="${ruta#\"}"; ruta="${ruta%\'}"; ruta="${ruta#\'}"
+        # Quitar los escapes que agrega el autocompletado con Tab (ej: "mensaje\ base32.txt")
+        ruta="$(printf '%s' "$ruta" | sed 's/\\\(.\)/\1/g')"
+        # Expandir ~ al directorio personal
+        [[ "$ruta" == "~/"* ]] && ruta="$HOME/${ruta:2}"
+        if [ -z "$ruta" ] && [ -n "$archivo" ]; then
+            return
+        elif [ -f "$ruta" ]; then
+            archivo="$ruta"
+            return
+        fi
+        echo "Error: el archivo '$ruta' no existe." >&2
+    done
+}
+
+# Nombre de salida: "<nombre> desencriptado.<ext>" en el mismo directorio
+nombre_salida() {
+    local dir base
+    dir="$(dirname -- "$archivo")"
+    base="$(basename -- "$archivo")"
+    if [[ "$base" == *.* ]]; then
+        echo "$dir/${base%.*} desencriptado.${base##*.}"
+    else
+        echo "$dir/$base desencriptado"
+    fi
+}
+
+# Extrae los bloques candidatos de la base elegida (palabras formadas solo por su alfabeto)
+extraer_bloques() {
+    local tipo="$1"
+    # ROT13 trabaja por línea completa (respeta los espacios entre palabras)
+    if [ "$tipo" = rot13 ]; then
+        grep '[A-Za-z]' "$archivo" | tr -d '\r'
+        return
+    fi
+    tr -s '[:space:]' '\n' < "$archivo" | case "$tipo" in
+        base64) grep -E '^[A-Za-z0-9+/=]+$' | grep -oE '[A-Za-z0-9+/]+={0,2}' \
+                    | awk 'length($0) % 4 == 0' ;;
+        base32) grep -E '^[A-Z2-7=]+$' | grep -oE '[A-Z2-7]+={0,6}' \
+                    | awk 'length($0) % 8 == 0' ;;
+        base58) grep -E "^[$ALFABETO58]{6,}$" ;;
+        hex)    grep -E '^[0-9A-Fa-f]+$' | awk 'length($0) % 2 == 0' ;;
+    esac
+}
+
+# Base58 (alfabeto Bitcoin) -> hexadecimal, usando bc para números grandes
+base58_a_hex() {
+    local s="$1" expr="obase=16;n=0;" c prefijo hex ceros="" i
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        prefijo="${ALFABETO58%%"$c"*}"
+        expr+="n=n*58+${#prefijo};"
+    done
+    hex="$(BC_LINE_LENGTH=0 bc <<< "${expr}n")"
+    [ "$hex" = "0" ] && hex=""
+    [ $(( ${#hex} % 2 )) -eq 1 ] && hex="0$hex"
+    # Cada '1' inicial representa un byte 0x00
+    while [ "${s:0:1}" = "1" ]; do ceros+="00"; s="${s:1}"; done
+    printf '%s' "$ceros$hex"
+}
+
+# Cuenta palabras comunes en un texto
+contar_palabras() {
+    grep -oiwE "$PALABRAS" | wc -l
+}
+
+# Decodifica un bloque en $tmp; falla si no es decodificable
+decodificar() {
+    local tipo="$1" bloque="$2"
+    case "$tipo" in
+        base64) printf '%s' "$bloque" | base64 -d > "$tmp" 2>/dev/null ;;
+        base32) printf '%s' "$bloque" | base32 -d > "$tmp" 2>/dev/null ;;
+        base58) base58_a_hex "$bloque" | xxd -r -p > "$tmp" 2>/dev/null ;;
+        hex)    printf '%s' "$bloque" | xxd -r -p > "$tmp" 2>/dev/null ;;
+        rot13)  printf '%s' "$bloque" | tr 'A-Za-z' 'N-ZA-Mn-za-m' > "$tmp"
+                # Cualquier texto "se descifra" con ROT13: solo se acepta si quedan más palabras reconocibles
+                [ "$(contar_palabras < "$tmp")" -gt "$(printf '%s' "$bloque" | contar_palabras)" ] ;;
+    esac
+}
+
+# El resultado tiene que ser texto legible: UTF-8 válido, sin caracteres de control y con alguna letra/número
+es_texto() {
+    [ -s "$tmp" ] || return 1
+    iconv -f UTF-8 -t UTF-8 "$tmp" > /dev/null 2>&1 || return 1
+    LC_ALL=C tr -d '\t\n\r' < "$tmp" | LC_ALL=C grep -q '[[:cntrl:]]' && return 1
+    grep -q '[[:alnum:]]' "$tmp" || return 1
+    # Al menos el 90 % tienen que ser letras, números, espacios o puntuación
+    local total buenos
+    total="$(grep -o . "$tmp" | wc -l)"
+    buenos="$(grep -o '[[:alnum:][:space:][:punct:]]' "$tmp" | wc -l)"
+    [ $((buenos * 10)) -ge $((total * 9)) ]
+}
+
+# Limpia la pantalla (solo si se está usando en una terminal)
+limpiar() {
+    [ -t 1 ] && clear
+    return 0
+}
+
+# Espera Enter antes de volver al menú
+pausa() {
+    echo
+    read -r -p "Presione Enter para volver al menú..." _ || exit 0
+}
+
+procesar() {
+    local tipo="$1" bloque salida resultado="" n=0
+    # Quitar repetidos antes de decodificar (orden de aparición)
+    while IFS= read -r bloque; do
+        decodificar "$tipo" "$bloque" && es_texto || continue
+        [ "$n" -gt 0 ] && resultado+=$'\n'
+        resultado+="$(cat "$tmp")"$'\n'
+        n=$((n + 1))
+    done < <(extraer_bloques "$tipo" | awk '!seen[$0]++')
+
+    if [ "$n" -eq 0 ]; then
+        echo "Error: no se encontró nada en $tipo en '$archivo'. Petición rechazada." >&2
+        return
+    fi
+
+    salida="$(nombre_salida)"
+    printf '%s' "$resultado" | tee "$salida"
+    echo "-> $n mensaje(s) únicos guardados en: $salida"
+}
+
+# Archivo inicial: argumento o pregunta
+if [ "$#" -ge 1 ] && [ -f "$1" ]; then
+    archivo="$1"
+else
+    [ "$#" -ge 1 ] && echo "Error: el archivo '$1' no existe." >&2
+    elegir_archivo
+fi
+
+while true; do
+    limpiar
+    echo "===== Archivo: $archivo ====="
+    echo "1) Base64"
+    echo "2) Base32"
+    echo "3) Base58"
+    echo "4) Hexadecimal (base16)"
+    echo "5) ROT13"
+    echo "6) Cambiar archivo"
+    echo "7) Salir"
+    read -r -p "Opción: " opcion || exit 0
+    limpiar
+    case "$opcion" in
+        1) procesar base64; pausa ;;
+        2) procesar base32; pausa ;;
+        3) procesar base58; pausa ;;
+        4) procesar hex; pausa ;;
+        5) procesar rot13; pausa ;;
+        6) elegir_archivo ;;
+        7) echo "Saliendo."; exit 0 ;;
+        *) echo "Opción inválida." >&2; pausa ;;
+    esac
+done
