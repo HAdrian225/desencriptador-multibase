@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
 # Menú para limpiar (quitar repetidos) y decodificar archivos en base64, base32, base58, hexadecimal o ROT13.
+# Soporta mensajes codificados varias veces (capas combinadas) y cuenta cuántas veces se descifró.
 set -uo pipefail
 
 ALFABETO58="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 # Palabras comunes (español/inglés) para reconocer texto descifrado con ROT13
 PALABRAS='el|la|de|que|es|un|una|en|los|las|por|con|para|este|esta|texto|mensaje|clave|the|is|an|and|of|to|in|this|that|key|secure|message'
+# Formatos de flag conocidos: también sirven para reconocer un ROT13 correcto
+PATRON_FLAG='(HTB|flag|CTF|THM)\{'
+# Formatos que se prueban al seguir decodificando capas (base58 no: da demasiados falsos positivos)
+FORMATOS_CAPAS=(hex base32 base64 rot13)
+MAX_CAPAS=20
 
 archivo=""
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+tmp_capa="$(mktemp)"
+tmp_look="$(mktemp)"
+trap 'rm -f "$tmp" "$tmp_capa" "$tmp_look"' EXIT
+
+# Formatos aplicados al mensaje actual, en orden
+CAPAS=()
+# Caracteres descartados al inicio de un base64 desalineado
+DESCARTADOS=""
 
 # Pide un archivo hasta que exista (o el usuario cancele con Enter vacío si ya había uno)
 elegir_archivo() {
@@ -46,14 +59,14 @@ nombre_salida() {
 # Extrae los bloques candidatos de la base elegida (palabras formadas solo por su alfabeto)
 extraer_bloques() {
     local tipo="$1"
-    # ROT13 trabaja por línea completa (respeta los espacios entre palabras)
-    if [ "$tipo" = rot13 ]; then
-        grep '[A-Za-z]' "$archivo" | tr -d '\r'
+    # ROT13 y el modo automático trabajan por línea completa
+    if [ "$tipo" = rot13 ] || [ "$tipo" = auto ]; then
+        grep -v '^[[:space:]]*$' "$archivo" | tr -d '\r'
         return
     fi
     tr -s '[:space:]' '\n' < "$archivo" | case "$tipo" in
-        base64) grep -E '^[A-Za-z0-9+/=]+$' | grep -oE '[A-Za-z0-9+/]+={0,2}' \
-                    | awk 'length($0) % 4 == 0' ;;
+        # Sin filtrar por largo: un bloque desalineado se corrige al decodificar
+        base64) grep -E '^[A-Za-z0-9+/=]+$' | grep -oE '[A-Za-z0-9+/]+={0,2}' ;;
         base32) grep -E '^[A-Z2-7=]+$' | grep -oE '[A-Z2-7]+={0,6}' \
                     | awk 'length($0) % 8 == 0' ;;
         base58) grep -E "^[$ALFABETO58]{6,}$" ;;
@@ -82,31 +95,106 @@ contar_palabras() {
     grep -oiwE "$PALABRAS" | wc -l
 }
 
-# Decodifica un bloque en $tmp; falla si no es decodificable
+# El resultado tiene que ser texto legible: UTF-8 válido, sin caracteres de control y con alguna letra/número
+es_texto() {
+    local f="$1"
+    [ -s "$f" ] || return 1
+    iconv -f UTF-8 -t UTF-8 "$f" > /dev/null 2>&1 || return 1
+    LC_ALL=C tr -d '\t\n\r' < "$f" | LC_ALL=C grep -q '[[:cntrl:]]' && return 1
+    grep -q '[[:alnum:]]' "$f" || return 1
+    # Al menos el 90 % tienen que ser letras, números, espacios o puntuación
+    local total buenos
+    total="$(grep -o . "$f" | wc -l)"
+    buenos="$(grep -o '[[:alnum:][:space:][:punct:]]' "$f" | wc -l)"
+    [ $((buenos * 10)) -ge $((total * 9)) ]
+}
+
+# Decodifica un bloque en el archivo destino; falla si no es decodificable o no da texto legible
 decodificar() {
-    local tipo="$1" bloque="$2"
+    local tipo="$1" bloque="$2" destino="${3:-$tmp}" limpio off t rotado
     case "$tipo" in
-        base64) printf '%s' "$bloque" | base64 -d > "$tmp" 2>/dev/null ;;
-        base32) printf '%s' "$bloque" | base32 -d > "$tmp" 2>/dev/null ;;
-        base58) base58_a_hex "$bloque" | xxd -r -p > "$tmp" 2>/dev/null ;;
-        hex)    printf '%s' "$bloque" | xxd -r -p > "$tmp" 2>/dev/null ;;
-        rot13)  printf '%s' "$bloque" | tr 'A-Za-z' 'N-ZA-Mn-za-m' > "$tmp"
-                # Cualquier texto "se descifra" con ROT13: solo se acepta si quedan más palabras reconocibles
-                [ "$(contar_palabras < "$tmp")" -gt "$(printf '%s' "$bloque" | contar_palabras)" ] ;;
+        base64)
+            limpio="$(printf '%s' "$bloque" | tr -d '[:space:]')"
+            [[ "$limpio" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+            # Si hay basura al inicio el bloque queda desalineado: probar descartando 1 a 3 caracteres
+            for off in 0 1 2 3; do
+                t="${limpio:off}"
+                [ $(( ${#t} % 4 )) -eq 0 ] || continue
+                if printf '%s' "$t" | base64 -d > "$destino" 2>/dev/null && es_texto "$destino"; then
+                    DESCARTADOS="${limpio:0:off}"
+                    return 0
+                fi
+            done
+            return 1 ;;
+        base32)
+            limpio="$(printf '%s' "$bloque" | tr -d '[:space:]')"
+            [[ "$limpio" =~ ^[A-Z2-7]+={0,6}$ ]] && [ $(( ${#limpio} % 8 )) -eq 0 ] || return 1
+            printf '%s' "$limpio" | base32 -d > "$destino" 2>/dev/null && es_texto "$destino" ;;
+        base58)
+            limpio="$(printf '%s' "$bloque" | tr -d '[:space:]')"
+            [[ "$limpio" =~ ^[$ALFABETO58]+$ ]] || return 1
+            base58_a_hex "$limpio" | xxd -r -p > "$destino" 2>/dev/null && es_texto "$destino" ;;
+        hex)
+            # Acepta "48656c", "48 65 6c", "48:65:6c", "0x48 0x65" y "\x48\x65"
+            limpio="$(printf '%s' "$bloque" | sed -E 's/0[xX]([0-9a-fA-F]{2})/\1/g; s/\\x//g' | tr -d ' \t\r\n:,')"
+            [[ "$limpio" =~ ^([0-9a-fA-F]{2})+$ ]] || return 1
+            printf '%s' "$limpio" | xxd -r -p > "$destino" 2>/dev/null && es_texto "$destino" ;;
+        rot13)
+            printf '%s' "$bloque" | tr 'A-Za-z' 'N-ZA-Mn-za-m' > "$destino"
+            es_texto "$destino" || return 1
+            # Cualquier texto "se descifra" con ROT13: solo se acepta si quedan más palabras reconocibles,
+            # si aparece una flag o si el resultado se puede seguir decodificando
+            [ "$(contar_palabras < "$destino")" -gt "$(printf '%s' "$bloque" | contar_palabras)" ] && return 0
+            if grep -qiE "$PATRON_FLAG" "$destino" && ! printf '%s' "$bloque" | grep -qiE "$PATRON_FLAG"; then
+                return 0
+            fi
+            rotado="$(cat "$destino")"
+            decodificar hex "$rotado" "$tmp_look" || decodificar base32 "$rotado" "$tmp_look" \
+                || decodificar base64 "$rotado" "$tmp_look" || return 1
+            DESCARTADOS=""
+            return 0 ;;
     esac
 }
 
-# El resultado tiene que ser texto legible: UTF-8 válido, sin caracteres de control y con alguna letra/número
-es_texto() {
-    [ -s "$tmp" ] || return 1
-    iconv -f UTF-8 -t UTF-8 "$tmp" > /dev/null 2>&1 || return 1
-    LC_ALL=C tr -d '\t\n\r' < "$tmp" | LC_ALL=C grep -q '[[:cntrl:]]' && return 1
-    grep -q '[[:alnum:]]' "$tmp" || return 1
-    # Al menos el 90 % tienen que ser letras, números, espacios o puntuación
-    local total buenos
-    total="$(grep -o . "$tmp" | wc -l)"
-    buenos="$(grep -o '[[:alnum:][:space:][:punct:]]' "$tmp" | wc -l)"
-    [ $((buenos * 10)) -ge $((total * 9)) ]
+avisar_descartados() {
+    if [ -n "$DESCARTADOS" ]; then
+        echo "Aviso: se descartaron ${#DESCARTADOS} caracter(es) iniciales no alineados: '$DESCARTADOS'"
+    fi
+    return 0
+}
+
+# Sigue decodificando $tmp capa por capa mientras dé texto legible; agrega cada formato a CAPAS
+seguir_capas() {
+    local actual tipo
+    while [ "${#CAPAS[@]}" -lt "$MAX_CAPAS" ]; do
+        actual="$(cat "$tmp")"
+        for tipo in "${FORMATOS_CAPAS[@]}"; do
+            DESCARTADOS=""
+            if decodificar "$tipo" "$actual" "$tmp_capa"; then
+                avisar_descartados
+                cp "$tmp_capa" "$tmp"
+                CAPAS+=("$tipo")
+                continue 2
+            fi
+        done
+        break
+    done
+}
+
+# Decodifica un bloque (primera capa con el formato elegido, o automática) y deja el texto en $tmp
+descifrar_bloque() {
+    local tipo="$1" bloque="$2"
+    CAPAS=()
+    DESCARTADOS=""
+    if [ "$tipo" = auto ]; then
+        printf '%s' "$bloque" > "$tmp"
+    else
+        decodificar "$tipo" "$bloque" || return 1
+        avisar_descartados
+        CAPAS=("$tipo")
+    fi
+    seguir_capas
+    [ "${#CAPAS[@]}" -gt 0 ]
 }
 
 # Limpia la pantalla (solo si se está usando en una terminal)
@@ -122,22 +210,46 @@ pausa() {
 }
 
 procesar() {
-    local tipo="$1" bloque salida resultado="" n=0
+    local tipo="$1" linea bloque salida resultado="" n=0 total=0 cadena m
+    local -A por_formato=()
+    local -a candidatos
+
     # Quitar repetidos antes de decodificar (orden de aparición)
-    while IFS= read -r bloque; do
-        decodificar "$tipo" "$bloque" && es_texto || continue
-        [ "$n" -gt 0 ] && resultado+=$'\n'
-        resultado+="$(cat "$tmp")"$'\n'
-        n=$((n + 1))
+    while IFS= read -r linea; do
+        candidatos=("$linea")
+        # En modo automático, si la línea entera no se descifra se prueban sus bloques por separado
+        if [ "$tipo" = auto ] && ! descifrar_bloque auto "$linea" > /dev/null; then
+            mapfile -t candidatos < <(printf '%s\n' "$linea" | grep -oE '[A-Za-z0-9+/]+={0,2}' | awk '!seen[$0]++')
+        fi
+        for bloque in "${candidatos[@]}"; do
+            descifrar_bloque "$tipo" "$bloque" || continue
+            n=$((n + 1))
+            total=$((total + ${#CAPAS[@]}))
+            for m in "${CAPAS[@]}"; do por_formato[$m]=$(( ${por_formato[$m]:-0} + 1 )); done
+            cadena="$(printf '%s → ' "${CAPAS[@]}")"
+            [ "$n" -gt 1 ] && { echo; resultado+=$'\n'; }
+            echo "[Mensaje $n] descifrado ${#CAPAS[@]} vez/veces: ${cadena% → }"
+            printf '%s\n' "$(cat "$tmp")"
+            resultado+="$(cat "$tmp")"$'\n'
+        done
     done < <(extraer_bloques "$tipo" | awk '!seen[$0]++')
 
     if [ "$n" -eq 0 ]; then
-        echo "Error: no se encontró nada en $tipo en '$archivo'. Petición rechazada." >&2
+        if [ "$tipo" = auto ]; then
+            echo "Error: no se pudo descifrar nada en '$archivo'. Petición rechazada." >&2
+        else
+            echo "Error: no se encontró nada en $tipo en '$archivo'. Petición rechazada." >&2
+        fi
         return
     fi
 
     salida="$(nombre_salida)"
-    printf '%s' "$resultado" | tee "$salida"
+    printf '%s' "$resultado" > "$salida"
+    echo
+    echo "=== Contador: $total descifrado(s) en total ==="
+    for m in base64 base32 base58 hex rot13; do
+        [ -n "${por_formato[$m]:-}" ] && echo "  $m: ${por_formato[$m]}"
+    done
     echo "-> $n mensaje(s) únicos guardados en: $salida"
 }
 
@@ -157,8 +269,9 @@ while true; do
     echo "3) Base58"
     echo "4) Hexadecimal (base16)"
     echo "5) ROT13"
-    echo "6) Cambiar archivo"
-    echo "7) Salir"
+    echo "6) Automático (detecta varias capas)"
+    echo "7) Cambiar archivo"
+    echo "8) Salir"
     read -r -p "Opción: " opcion || exit 0
     limpiar
     case "$opcion" in
@@ -167,8 +280,9 @@ while true; do
         3) procesar base58; pausa ;;
         4) procesar hex; pausa ;;
         5) procesar rot13; pausa ;;
-        6) elegir_archivo ;;
-        7) echo "Saliendo."; exit 0 ;;
+        6) procesar auto; pausa ;;
+        7) elegir_archivo ;;
+        8) echo "Saliendo."; exit 0 ;;
         *) echo "Opción inválida." >&2; pausa ;;
     esac
 done

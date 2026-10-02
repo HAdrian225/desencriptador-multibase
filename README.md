@@ -3,6 +3,7 @@
 Herramienta de terminal en Bash para **limpiar y decodificar** archivos de texto.
 Se instala como el comando `desencriptador`.
 Elimina los mensajes repetidos, decodifica solo los únicos y guarda el resultado en un archivo nuevo.
+Si un mensaje está codificado varias veces (por ejemplo base64 → hex → rot13), sigue descifrando todas las capas y cuenta cuántas veces tuvo que hacerlo.
 
 Formatos soportados:
 
@@ -13,6 +14,7 @@ Formatos soportados:
 | 3 | Base58 (alfabeto Bitcoin) |
 | 4 | Hexadecimal (base16) |
 | 5 | ROT13 |
+| 6 | Automático: detecta el formato y descifra varias capas |
 
 Si el archivo no contiene nada parecido al formato elegido, el programa muestra un error, no crea nada y vuelve al menú.
 
