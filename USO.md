@@ -50,7 +50,7 @@ Opción [d]:
 
 - **d** (o Enter): descifra la capa siguiente a partir de lo que estás viendo.
 - **x**: aplica XOR con una clave de un byte que escribís vos (`35` o `0x23`).
-- **c**: si la capa es un hash, lo crackea con un diccionario (ver más abajo).
+- **c**: si la capa es un hash, lo crackea con hashcat o con un diccionario (ver más abajo).
 - **a**: vuelve a la capa anterior (por ejemplo, si una capa no era la correcta).
 - **g**: guarda la capa actual junto al original, con ` desencriptado` agregado al nombre:
   `mensaje.txt` → `mensaje desencriptado.txt`. **Siempre se guarda como `.txt`**: si la capa es binaria,
@@ -102,32 +102,45 @@ Un hash no se puede desencriptar: solo se puede crackear con un diccionario (opc
 
 ## Crackear un hash (opción c)
 
-Un hash (SHA-256, MD5...) no se puede revertir: la única forma es probar palabras hasta encontrar una
-que dé el mismo hash. Con **c** el programa pide un diccionario (un archivo con una palabra por línea)
-o una sola palabra para probar:
+Un hash (SHA-256, MD5...) no se puede revertir: la única forma es probar contraseñas hasta encontrar
+una que dé el mismo hash. Si está instalado **hashcat**, la opción **c** ofrece cuatro métodos:
 
 ```
 Hash SHA-256: b460b1982188f11d175f60ed670027e1afdd16558919fe47023ecd38329e0b7f
-Diccionario o palabra a probar [/usr/share/wordlists/rockyou.txt]: ~/wordlists/rockyou.txt
-Probando con '/home/usuario/wordlists/rockyou.txt' (Ctrl+C para cancelar)...
-Encontrado con SHA-256 tras 4 palabra(s): hola123
+1) Diccionario   2) Diccionario + reglas   3) Fuerza bruta (máscara)   4) Probar una palabra
+Método [1]:
 ```
 
-- Si existe `/usr/share/wordlists/rockyou.txt`, `~/wordlists/rockyou.txt` o `/usr/share/john/password.lst`,
-  se usa como valor por defecto (Enter).
-- Según el largo prueba: 32 → MD5 (y NTLM si el Python lo soporta), 40 → SHA-1, 56 → SHA-224 y SHA3-224,
-  64 → SHA-256 y SHA3-256, 96 → SHA-384 y SHA3-384, 128 → SHA-512 y SHA3-512.
-- Prueba unas 300 000 palabras por segundo: rockyou completo (14 millones) tarda menos de un minuto.
-- **Ctrl+C** corta el ataque sin cerrar el programa.
-- Si la encuentra, la palabra queda como capa nueva y se puede guardar con **g**.
+| Método | Qué prueba | Ejemplo |
+|---|---|---|
+| 1) Diccionario | cada palabra del diccionario tal cual | `hola123` |
+| 2) Diccionario + reglas | cada palabra con variaciones (mayúsculas, números o símbolos al final, leetspeak...) | `Hola123!` con `dive.rule` |
+| 3) Fuerza bruta | todas las combinaciones de una máscara, desde 1 carácter hasta su largo | `zx9` con `?a?a?a` |
+| 4) Probar una palabra | una sola palabra (sin GPU) | |
+
+- **Diccionario**: Enter usa `~/wordlists/rockyou.txt` (o `/usr/share/wordlists/rockyou.txt`).
+- **Reglas**: un nombre de `/usr/share/hashcat/rules` o una ruta. Enter usa `best66.rule` (66 variaciones,
+  rápido); `rockyou-30000.rule` y `dive.rule` prueban muchas más (minutos con rockyou completo).
+- **Máscara**: `?l` minúsculas, `?u` mayúsculas, `?d` dígitos, `?s` símbolos, `?a` todo. Enter usa
+  `?a?a?a?a?a?a` (hasta 6 caracteres de cualquier tipo). Cada carácter `?a` más multiplica el tiempo por 95.
+- Según el largo prueba: 32 → MD5 y NTLM, 40 → SHA-1, 56 → SHA-224 y SHA3-224, 64 → SHA-256 y SHA3-256,
+  96 → SHA-384 y SHA3-384, 128 → SHA-512 y SHA3-512.
+- Mientras corre: **s** muestra el estado y **q** (o Ctrl+C) corta el ataque sin cerrar el programa.
+- Lo encontrado queda en el potfile de hashcat: si volvés a crackear el mismo hash, sale al instante.
+- Si lo encuentra, la palabra queda como capa nueva y se puede guardar con **g**.
+
+```
+>> hashcat SHA-256 (modo 1400). Teclas: s = estado, q = cortar
+Encontrado con SHA-256: Hola123!
+```
+
+Como referencia, con una RTX 2060: rockyou completo en ~1 segundo, rockyou + `best66` en ~2 segundos.
+
+**Sin hashcat**, la opción **c** pide directamente un diccionario o una palabra y lo prueba en Python
+(unas 300 000 palabras por segundo: rockyou completo en menos de un minuto, sin reglas ni fuerza bruta).
 
 `install.sh` descarga `rockyou.txt` en `~/wordlists/` (ver la [guía de instalación](INSTALACION.md)),
 así que normalmente alcanza con apretar Enter.
-
-**Base64 desalineado**: si al copiar un bloque se colaron 1 a 3 caracteres de más al principio,
-el programa los descarta y lo indica en la descripción de la capa.
-
-**Hexadecimal**: además de `48656c`, acepta `48 65 6c`, `48:65:6c`, `0x48 0x65` y `\x48\x65`.
 
 ## Práctica con los ejemplos
 
@@ -169,6 +182,7 @@ printf 'Hola mundo'   | gzip | base64 -w0       # gzip + Base64
 - **XOR**: solo claves de un byte. Un XOR puede dar caracteres imprimibles y verse como "texto" aunque no lo sea.
 - **Base58**: solo se prueba sobre el contenido completo y con 6 caracteres o más.
 - **Base64 sin relleno (`=`)**: si varios bloques sin `=` están pegados en la misma línea, no se pueden separar; ponelos uno por línea.
-- **Hashes**: solo ataque de diccionario, sin reglas ni fuerza bruta; para eso conviene hashcat o john.
-  NTLM necesita MD4, que el OpenSSL 3 de Ubuntu trae desactivado: en ese caso solo se prueba MD5.
+- **Hashes**: solo hashes sin sal (salt) y de esos largos. Si un hash no aparece, puede no venir de una
+  contraseña (por ejemplo, el hash de un archivo o una clave aleatoria de 256 bits).
+  Sin hashcat no hay reglas ni fuerza bruta, y NTLM no se prueba (el OpenSSL 3 de Ubuntu trae MD4 desactivado).
 - Los binarios no se siguen decodificando solos (salvo gzip/zlib, que se descomprimen al detectarlos).

@@ -21,6 +21,11 @@ MIN_BINARIO=64
 declare -A HASHES=([32]="MD5 o NTLM" [40]="SHA-1" [56]="SHA-224" [64]="SHA-256" [96]="SHA-384" [128]="SHA-512")
 # Diccionarios que se buscan si no se indica uno al crackear un hash
 DICCIONARIOS=(/usr/share/wordlists/rockyou.txt "$HOME/wordlists/rockyou.txt" /usr/share/john/password.lst)
+# hashcat: modos para cada largo de hash, sus nombres y dónde están las reglas
+declare -A HC_MODOS=([32]="0 1000" [40]="100" [56]="1300 17300" [64]="1400 17400" [96]="10800 17500" [128]="1700 17600")
+declare -A HC_NOMBRES=([0]=MD5 [1000]=NTLM [100]=SHA-1 [1300]=SHA-224 [17300]=SHA3-224 [1400]=SHA-256 [17400]=SHA3-256
+    [10800]=SHA-384 [17500]=SHA3-384 [1700]=SHA-512 [17600]=SHA3-512)
+REGLAS_DIR=/usr/share/hashcat/rules
 
 archivo=""
 trabajo="$(mktemp -d)"
@@ -278,29 +283,54 @@ detectar_hash() {
 
 # Ataque de diccionario contra el hash de la capa actual: prueba cada palabra con los algoritmos
 # de ese largo (MD5/NTLM, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512) y agrega la palabra como capa nueva
-crackear() {
-    local actual="${CAPA_ARCH[${#CAPA_ARCH[@]}-1]}" nuevo="$trabajo/capa${#CAPA_ARCH[@]}" dic="" d r
-    if ! detectar_hash "$actual"; then
-        echo "Error: la capa actual no es un hash (MD5, SHA-1, SHA-224, SHA-256, SHA-384 o SHA-512)." >&2
-        return 1
-    fi
+# Pide un diccionario (Enter = el primero de DICCIONARIOS que exista) y lo deja en DIC.
+# Con $1 = "palabra" también acepta una palabra suelta en vez de un archivo.
+pedir_diccionario() {
+    local d r
+    DIC=""
     for d in "${DICCIONARIOS[@]}"; do
-        [ -f "$d" ] && { dic="$d"; break; }
+        [ -f "$d" ] && { DIC="$d"; break; }
     done
-    echo "Hash $HASH_TIPO: $HASH_VALOR"
-    if [ -n "$dic" ]; then
-        read -r -e -p "Diccionario o palabra a probar [$dic]: " r || exit 0
+    if [ "${1:-}" = palabra ]; then
+        read -r -e -p "Diccionario o palabra a probar${DIC:+ [$DIC]}: " r || exit 0
     else
-        read -r -e -p "Diccionario (un archivo con una palabra por línea) o palabra a probar: " r || exit 0
+        read -r -e -p "Diccionario (una palabra por línea)${DIC:+ [$DIC]}: " r || exit 0
     fi
     r="${r%\"}"; r="${r#\"}"; r="${r%\'}"; r="${r#\'}"
     [[ "$r" == "~/"* ]] && r="$HOME/${r:2}"
-    [ -n "$r" ] && dic="$r"
-    if [ -z "$dic" ]; then
+    [ -n "$r" ] && DIC="$r"
+    if [ -z "$DIC" ]; then
         echo "Error: no se indicó diccionario." >&2
         return 1
+    elif [ "${1:-}" != palabra ] && [ ! -f "$DIC" ]; then
+        echo "Error: el diccionario '$DIC' no existe." >&2
+        return 1
     fi
-    [ -f "$dic" ] && echo "Probando con '$dic' (Ctrl+C para cancelar)..."
+}
+
+# Pide un archivo de reglas de hashcat (nombre de /usr/share/hashcat/rules o ruta) y lo deja en REGLAS
+pedir_reglas() {
+    local r def=""
+    for r in best66.rule best64.rule; do
+        [ -f "$REGLAS_DIR/$r" ] && { def="$r"; break; }
+    done
+    read -r -e -p "Reglas (best66.rule, rockyou-30000.rule, dive.rule... o una ruta)${def:+ [$def]}: " r || exit 0
+    r="${r:-$def}"
+    [[ "$r" == "~/"* ]] && r="$HOME/${r:2}"
+    if [ -f "$r" ]; then
+        REGLAS="$r"
+    elif [ -f "$REGLAS_DIR/$r" ]; then
+        REGLAS="$REGLAS_DIR/$r"
+    else
+        echo "Error: no se encontró el archivo de reglas '$r'." >&2
+        return 1
+    fi
+}
+
+# Ataque de diccionario en Python, sin hashcat ($1 = diccionario o palabra). Deja la palabra en $2.
+crackear_python() {
+    local nuevo="$2" r
+    [ -f "$1" ] && echo "Probando con '$1' (Ctrl+C para cancelar)..."
     # Ctrl+C corta solo el ataque, no el programa
     trap 'true' INT
     python3 -I -c '
@@ -346,13 +376,119 @@ except KeyboardInterrupt:
 usados = ", ".join(bonito(x) for x, _ in pruebas)
 print(f"No se encontró: se probaron {n:,} palabra(s) con {usados}.", file=sys.stderr)
 sys.exit(1)
-' "$HASH_VALOR" "$dic" "$nuevo"
+' "$HASH_VALOR" "$1" "$nuevo"
     r=$?
     trap - INT
     [ "$r" -eq 0 ] || return 1
-    if [ -f "$dic" ]; then d="diccionario $(basename -- "$dic")"; else d="la palabra indicada"; fi
-    agregar_capa "$(cat "$nuevo.alg") crackeado con $d" "$nuevo"
+    HC_ALG="$(cat "$nuevo.alg")"
     rm -f -- "$nuevo.alg"
+}
+
+# Deja en $3 la palabra que encontró hashcat ($2) con el modo $1
+hc_encontrado() {
+    # hashcat escribe $HEX[...] cuando la palabra tiene caracteres no imprimibles
+    if [[ "$2" =~ ^\$HEX\[([0-9a-fA-F]*)\]$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}" | xxd -r -p > "$3"
+        echo >> "$3"
+    else
+        printf '%s\n' "$2" > "$3"
+    fi
+    HC_ALG="${HC_NOMBRES[$1]}"
+    echo "Encontrado con $HC_ALG${HC_POTFILE:+ (ya estaba en el potfile de hashcat)}: $2"
+}
+
+# Ataque con hashcat (GPU): prueba cada modo que corresponde al largo del hash con los argumentos
+# de ataque recibidos ($2...). $1 = archivo donde dejar la palabra. Los resultados quedan en el
+# potfile de hashcat, así que un hash ya crackeado sale al instante.
+crackear_hashcat() {
+    local nuevo="$1" hashf="$trabajo/hash.txt" m plano r fallo=""
+    # Sesión propia: hashcat no deja correr dos instancias con la misma sesión
+    local -a opciones=(-O -w 3 --quiet --status --status-timer 30 --session "desencriptador_$$")
+    shift
+    printf '%s\n' "${HASH_VALOR,,}" > "$hashf"
+    HC_POTFILE=""
+    # Si ya se crackeó antes, está en el potfile de hashcat: no hace falta atacarlo de nuevo
+    for m in ${HC_MODOS[${#HASH_VALOR}]}; do
+        plano="$(hashcat -m "$m" --show --outfile-format 2 "$hashf" 2>/dev/null | head -n 1)"
+        if [ -n "$plano" ]; then
+            HC_POTFILE=1
+            hc_encontrado "$m" "$plano" "$nuevo"
+            return 0
+        fi
+    done
+    # Ctrl+C (o q) corta solo el ataque, no el programa
+    trap 'true' INT
+    for m in ${HC_MODOS[${#HASH_VALOR}]}; do
+        echo
+        echo ">> hashcat ${HC_NOMBRES[$m]} (modo $m). Teclas: s = estado, q = cortar"
+        # Sin terminal (ej: entrada por tubería) hashcat no tiene que leer teclas de stdin
+        if [ -t 0 ]; then
+            hashcat -m "$m" "${opciones[@]}" "$hashf" "$@"
+        else
+            hashcat -m "$m" "${opciones[@]}" "$hashf" "$@" < /dev/null
+        fi
+        # 0 = encontrado, 1 = agotado sin encontrar; otro código = error o cortado
+        r=$?
+        [ "$r" -gt 1 ] && fallo+=" ${HC_NOMBRES[$m]} (código $r)"
+        plano="$(hashcat -m "$m" --show --outfile-format 2 "$hashf" 2>/dev/null | head -n 1)"
+        if [ -n "$plano" ]; then
+            trap - INT
+            hc_encontrado "$m" "$plano" "$nuevo"
+            return 0
+        fi
+    done
+    trap - INT
+    if [ -n "$fallo" ]; then
+        echo "hashcat no terminó (error o cortado):$fallo. Revisá los mensajes de arriba." >&2
+    else
+        echo "No se encontró: hashcat agotó el ataque con$(for m in ${HC_MODOS[${#HASH_VALOR}]}; do printf ' %s' "${HC_NOMBRES[$m]}"; done)." >&2
+    fi
+    return 1
+}
+
+# Crackea el hash de la capa actual y agrega la palabra encontrada como capa nueva.
+# Con hashcat: diccionario, diccionario + reglas, fuerza bruta o una palabra; sin hashcat, Python.
+crackear() {
+    local actual="${CAPA_ARCH[${#CAPA_ARCH[@]}-1]}" nuevo="$trabajo/capa${#CAPA_ARCH[@]}" metodo mascara desc
+    if ! detectar_hash "$actual"; then
+        echo "Error: la capa actual no es un hash (MD5, SHA-1, SHA-224, SHA-256, SHA-384 o SHA-512)." >&2
+        return 1
+    fi
+    echo "Hash $HASH_TIPO: $HASH_VALOR"
+    if command -v hashcat > /dev/null 2>&1; then
+        echo "1) Diccionario   2) Diccionario + reglas   3) Fuerza bruta (máscara)   4) Probar una palabra"
+        read -r -p "Método [1]: " metodo || exit 0
+    else
+        echo "(hashcat no está instalado: se usa un ataque de diccionario en Python, más lento)"
+        metodo=python
+    fi
+    case "${metodo:-1}" in
+        1)
+            pedir_diccionario || return 1
+            desc="hashcat, diccionario $(basename -- "$DIC")"
+            crackear_hashcat "$nuevo" -a 0 "$DIC" || return 1 ;;
+        2)
+            pedir_diccionario || return 1
+            pedir_reglas || return 1
+            desc="hashcat, diccionario $(basename -- "$DIC") + reglas $(basename -- "$REGLAS")"
+            crackear_hashcat "$nuevo" -a 0 -r "$REGLAS" "$DIC" || return 1 ;;
+        3)
+            echo "Máscara: ?l minúsculas, ?u mayúsculas, ?d dígitos, ?s símbolos, ?a todo. Prueba desde 1 carácter hasta el largo de la máscara."
+            read -r -p "Máscara [?a?a?a?a?a?a]: " mascara || exit 0
+            mascara="${mascara:-?a?a?a?a?a?a}"
+            desc="hashcat, fuerza bruta $mascara"
+            crackear_hashcat "$nuevo" -a 3 --increment "$mascara" || return 1 ;;
+        4|python)
+            HC_POTFILE=""
+            pedir_diccionario palabra || return 1
+            if [ -f "$DIC" ]; then desc="diccionario $(basename -- "$DIC")"; else desc="la palabra indicada"; fi
+            crackear_python "$DIC" "$nuevo" || return 1 ;;
+        *)
+            echo "Opción inválida." >&2
+            return 1 ;;
+    esac
+    [ -n "${HC_POTFILE:-}" ] && desc="hashcat, ya estaba en su potfile"
+    agregar_capa "$HC_ALG crackeado con $desc" "$nuevo"
 }
 
 # Descifra una capa más del contenido actual y la agrega como capa nueva
@@ -405,7 +541,7 @@ siguiente_capa() {
 
     if [ "$n" -eq 0 ] && [ -n "$hash" ]; then
         echo "Error: parece un hash $hash (${#contenido} caracteres hexadecimales), no un texto cifrado." >&2
-        echo "Un hash no se puede desencriptar: solo se puede crackear con un diccionario (opción c)." >&2
+        echo "Un hash no se puede desencriptar: solo se puede crackear (opción c)." >&2
         return 1
     elif [ "$n" -eq 0 ]; then
         echo "Error: no se reconoció ninguna otra capa codificada. Este parece ser el resultado final." >&2

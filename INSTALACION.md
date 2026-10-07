@@ -5,6 +5,9 @@
 - Linux (probado en Ubuntu) con **bash** 4 o superior.
 - Programas: `base64`, `base32`, `xxd`, `bc`, `iconv`, `grep`, `awk`, `sed`, `tr`, `gzip` y `python3`
   (este último para zlib/deflate, XOR y crackeo de hashes). `file` es opcional: si está, describe los resultados binarios.
+- **hashcat** (opcional, recomendado): crackea hashes con la GPU, con reglas y fuerza bruta
+  (`sudo apt install hashcat`). Sin hashcat, la opción **c** usa un ataque de diccionario en Python,
+  unas 50 veces más lento.
 - **Diccionario `rockyou.txt`** (para crackear hashes con la opción **c**): el instalador lo descarga de
   [SecLists](https://github.com/danielmiessler/SecLists) en `~/wordlists/rockyou.txt` si no lo encuentra
   (necesita `curl` o `wget`; son 53 MB comprimidos y 134 MB descomprimidos). Si ya existe en

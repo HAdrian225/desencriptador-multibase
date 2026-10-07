@@ -26,6 +26,11 @@ if [ "${#faltan[@]}" -gt 0 ]; then
     exit 1
 fi
 
+# hashcat es opcional: sin él, los hashes se crackean con Python (más lento y solo con diccionario)
+if ! command -v hashcat > /dev/null 2>&1; then
+    echo "Aviso: hashcat no está instalado; para crackear hashes con la GPU: sudo apt install hashcat"
+fi
+
 # Copiar el programa
 mkdir -p "$DESTINO"
 install -m 755 "$ORIGEN" "$DESTINO/desencriptador"
