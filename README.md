@@ -1,22 +1,24 @@
-# Desencriptador multibase: limpia y decodifica Base64, Base32, Base58, Hex y ROT13 desde la terminal
+# Desencriptador multibase: descifra capa por capa Base64, Base32, Base58, Hex, ROT13, gzip y XOR desde la terminal
 
-Herramienta de terminal en Bash para **limpiar y decodificar** archivos de texto.
+Herramienta de terminal en Bash para **decodificar archivos de texto paso a paso**.
 Se instala como el comando `desencriptador`.
-Elimina los mensajes repetidos, decodifica solo los únicos y guarda el resultado en un archivo nuevo.
-Si un mensaje está codificado varias veces (por ejemplo base64 → hex → rot13), sigue descifrando todas las capas y cuenta cuántas veces tuvo que hacerlo.
 
-Formatos soportados:
+Al ejecutarlo muestra la primera capa descifrada; si el resultado sigue codificado (o tiene otro
+mensaje codificado adentro), con una tecla se descifra la capa siguiente, y así hasta que decidas
+parar o no quede nada reconocible. El formato de cada capa se detecta solo.
 
-| Opción | Formato |
+Reconoce:
+
+| Tipo | Qué hace |
 |---|---|
-| 1 | Base64 |
-| 2 | Base32 |
-| 3 | Base58 (alfabeto Bitcoin) |
-| 4 | Hexadecimal (base16) |
-| 5 | ROT13 |
-| 6 | Automático: detecta el formato y descifra varias capas |
+| Base64, Base32, Base58, hexadecimal, ROT13 | decodifica el contenido completo |
+| Bloques dentro de un texto | busca, por ejemplo, el base64 que hay dentro de un script de PowerShell |
+| UTF-16LE | convierte a texto (por ejemplo `powershell -EncodedCommand`) |
+| gzip, zlib, deflate | descomprime (`GzipStream`, `DeflateStream`) |
+| XOR de un byte | automático si el texto indica la clave (`-bxor 35`), o manual con la clave que elijas |
 
-Si el archivo no contiene nada parecido al formato elegido, el programa muestra un error, no crea nada y vuelve al menú.
+Los resultados binarios (por ejemplo shellcode) se muestran como volcado hexadecimal con sus cadenas
+legibles y se pueden guardar como `.bin`. **El programa nunca ejecuta lo que decodifica.**
 
 ## Inicio rápido
 
@@ -24,7 +26,7 @@ Si el archivo no contiene nada parecido al formato elegido, el programa muestra 
 git clone https://github.com/HAdrian225/desencriptador-multibase.git desencriptador-multibase
 cd desencriptador-multibase
 ./install.sh
-desencriptador "ejemplos/mensaje base64.txt"
+desencriptador "ejemplos/mensaje varias capas.txt"
 ```
 
 ## Guías

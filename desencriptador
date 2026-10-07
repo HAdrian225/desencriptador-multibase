@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Menú para limpiar (quitar repetidos) y decodificar archivos en base64, base32, base58, hexadecimal o ROT13.
-# Soporta mensajes codificados varias veces (capas combinadas) y cuenta cuántas veces se descifró.
+# Desencriptador por capas: muestra el archivo decodificado y deja seguir descifrando capa por capa
+# (base64, base32, base58, hexadecimal, ROT13, UTF-16LE, gzip/zlib/deflate y XOR) hasta que el
+# usuario decida parar o no quede nada reconocible. Nunca ejecuta el contenido: solo lo decodifica.
 set -uo pipefail
 
 ALFABETO58="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -8,20 +9,28 @@ ALFABETO58="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 PALABRAS='el|la|de|que|es|un|una|en|los|las|por|con|para|este|esta|texto|mensaje|clave|the|is|an|and|of|to|in|this|that|key|secure|message'
 # Formatos de flag conocidos: también sirven para reconocer un ROT13 correcto
 PATRON_FLAG='(HTB|flag|CTF|THM)\{'
-# Formatos que se prueban al seguir decodificando capas (base58 no: da demasiados falsos positivos)
-FORMATOS_CAPAS=(hex base32 base64 rot13)
-MAX_CAPAS=20
+# Formatos que se prueban sobre el contenido completo, en orden
+FORMATOS=(hex base32 base64 base58 rot13)
+# Formatos que se prueban en los bloques codificados dentro de un texto (ej: base64 dentro de un script)
+FORMATOS_BLOQUES=(hex base32 base64)
+# Largo mínimo de esos bloques
+MIN_BLOQUE=16
+# Un bloque que da binario solo se acepta si es así de largo (si no, suele ser una palabra cualquiera)
+MIN_BINARIO=64
 
 archivo=""
-tmp="$(mktemp)"
-tmp_capa="$(mktemp)"
-tmp_look="$(mktemp)"
-trap 'rm -f "$tmp" "$tmp_capa" "$tmp_look"' EXIT
+trabajo="$(mktemp -d)"
+trap 'rm -rf "$trabajo"' EXIT
+tmp="$trabajo/tmp"
+tmp_look="$trabajo/look"
 
-# Formatos aplicados al mensaje actual, en orden
-CAPAS=()
+# Capas: CAPA_ARCH[i] tiene el contenido de la capa i (0 = archivo original); CAPA_DESC[i], cómo se obtuvo
+CAPA_ARCH=()
+CAPA_DESC=()
 # Caracteres descartados al inicio de un base64 desalineado
 DESCARTADOS=""
+# Transformaciones aplicadas después de decodificar (UTF-16LE, gzip, zlib, deflate, XOR)
+PASOS=()
 
 # Pide un archivo hasta que exista (o el usuario cancele con Enter vacío si ya había uno)
 elegir_archivo() {
@@ -44,34 +53,18 @@ elegir_archivo() {
     done
 }
 
-# Nombre de salida: "<nombre> desencriptado.<ext>" en el mismo directorio
+# Nombre de salida: "<nombre> desencriptado.<ext>" en el mismo directorio ($1 fuerza otra extensión)
 nombre_salida() {
-    local dir base
+    local ext="${1:-}" dir base
     dir="$(dirname -- "$archivo")"
     base="$(basename -- "$archivo")"
-    if [[ "$base" == *.* ]]; then
+    if [ -n "$ext" ]; then
+        echo "$dir/${base%.*} desencriptado.$ext"
+    elif [[ "$base" == *.* ]]; then
         echo "$dir/${base%.*} desencriptado.${base##*.}"
     else
         echo "$dir/$base desencriptado"
     fi
-}
-
-# Extrae los bloques candidatos de la base elegida (palabras formadas solo por su alfabeto)
-extraer_bloques() {
-    local tipo="$1"
-    # ROT13 y el modo automático trabajan por línea completa
-    if [ "$tipo" = rot13 ] || [ "$tipo" = auto ]; then
-        grep -v '^[[:space:]]*$' "$archivo" | tr -d '\r'
-        return
-    fi
-    tr -s '[:space:]' '\n' < "$archivo" | case "$tipo" in
-        # Sin filtrar por largo: un bloque desalineado se corrige al decodificar
-        base64) grep -E '^[A-Za-z0-9+/=]+$' | grep -oE '[A-Za-z0-9+/]+={0,2}' ;;
-        base32) grep -E '^[A-Z2-7=]+$' | grep -oE '[A-Z2-7]+={0,6}' \
-                    | awk 'length($0) % 8 == 0' ;;
-        base58) grep -E "^[$ALFABETO58]{6,}$" ;;
-        hex)    grep -E '^[0-9A-Fa-f]+$' | awk 'length($0) % 2 == 0' ;;
-    esac
 }
 
 # Base58 (alfabeto Bitcoin) -> hexadecimal, usando bc para números grandes
@@ -100,7 +93,7 @@ es_texto() {
     local f="$1"
     [ -s "$f" ] || return 1
     iconv -f UTF-8 -t UTF-8 "$f" > /dev/null 2>&1 || return 1
-    LC_ALL=C tr -d '\t\n\r' < "$f" | LC_ALL=C grep -q '[[:cntrl:]]' && return 1
+    LC_ALL=C tr -d '\t\n\r' < "$f" | LC_ALL=C grep -aq '[[:cntrl:]]' && return 1
     grep -q '[[:alnum:]]' "$f" || return 1
     # Al menos el 90 % tienen que ser letras, números, espacios o puntuación
     local total buenos
@@ -109,92 +102,241 @@ es_texto() {
     [ $((buenos * 10)) -ge $((total * 9)) ]
 }
 
-# Decodifica un bloque en el archivo destino; falla si no es decodificable o no da texto legible
+# Primeros $2 bytes de un archivo en hexadecimal
+hex_inicio() {
+    head -c "$2" "$1" | xxd -p | tr -d '\n'
+}
+
+# Decodifica un bloque tal cual en el archivo destino, sin exigir que dé texto
+# (ROT13 sí se valida, porque cualquier texto "se decodifica" con ROT13)
 decodificar() {
-    local tipo="$1" bloque="$2" destino="${3:-$tmp}" limpio off t rotado
+    local tipo="$1" bloque="$2" destino="$3" limpio off t rotado
     case "$tipo" in
         base64)
             limpio="$(printf '%s' "$bloque" | tr -d '[:space:]')"
             [[ "$limpio" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
-            # Si hay basura al inicio el bloque queda desalineado: probar descartando 1 a 3 caracteres
+            # Si hay basura al inicio el bloque queda desalineado: descartar 1 a 3 caracteres
             for off in 0 1 2 3; do
                 t="${limpio:off}"
                 [ $(( ${#t} % 4 )) -eq 0 ] || continue
-                if printf '%s' "$t" | base64 -d > "$destino" 2>/dev/null && es_texto "$destino"; then
-                    DESCARTADOS="${limpio:0:off}"
-                    return 0
-                fi
-            done
-            return 1 ;;
+                printf '%s' "$t" | base64 -d > "$destino" 2>/dev/null || return 1
+                DESCARTADOS="${limpio:0:off}"
+                break
+            done ;;
         base32)
             limpio="$(printf '%s' "$bloque" | tr -d '[:space:]')"
             [[ "$limpio" =~ ^[A-Z2-7]+={0,6}$ ]] && [ $(( ${#limpio} % 8 )) -eq 0 ] || return 1
-            printf '%s' "$limpio" | base32 -d > "$destino" 2>/dev/null && es_texto "$destino" ;;
+            printf '%s' "$limpio" | base32 -d > "$destino" 2>/dev/null || return 1 ;;
         base58)
             limpio="$(printf '%s' "$bloque" | tr -d '[:space:]')"
-            [[ "$limpio" =~ ^[$ALFABETO58]+$ ]] || return 1
-            base58_a_hex "$limpio" | xxd -r -p > "$destino" 2>/dev/null && es_texto "$destino" ;;
+            [[ "$limpio" =~ ^[$ALFABETO58]{6,}$ ]] || return 1
+            base58_a_hex "$limpio" | xxd -r -p > "$destino" 2>/dev/null || return 1 ;;
         hex)
             # Acepta "48656c", "48 65 6c", "48:65:6c", "0x48 0x65" y "\x48\x65"
             limpio="$(printf '%s' "$bloque" | sed -E 's/0[xX]([0-9a-fA-F]{2})/\1/g; s/\\x//g' | tr -d ' \t\r\n:,')"
             [[ "$limpio" =~ ^([0-9a-fA-F]{2})+$ ]] || return 1
-            printf '%s' "$limpio" | xxd -r -p > "$destino" 2>/dev/null && es_texto "$destino" ;;
+            printf '%s' "$limpio" | xxd -r -p > "$destino" 2>/dev/null || return 1 ;;
         rot13)
             printf '%s' "$bloque" | tr 'A-Za-z' 'N-ZA-Mn-za-m' > "$destino"
             es_texto "$destino" || return 1
-            # Cualquier texto "se descifra" con ROT13: solo se acepta si quedan más palabras reconocibles,
-            # si aparece una flag o si el resultado se puede seguir decodificando
+            # Solo se acepta si quedan más palabras reconocibles, si aparece una flag
+            # o si el resultado se puede seguir decodificando
             [ "$(contar_palabras < "$destino")" -gt "$(printf '%s' "$bloque" | contar_palabras)" ] && return 0
             if grep -qiE "$PATRON_FLAG" "$destino" && ! printf '%s' "$bloque" | grep -qiE "$PATRON_FLAG"; then
                 return 0
             fi
             rotado="$(cat "$destino")"
-            decodificar hex "$rotado" "$tmp_look" || decodificar base32 "$rotado" "$tmp_look" \
-                || decodificar base64 "$rotado" "$tmp_look" || return 1
+            a_texto hex "$rotado" || a_texto base32 "$rotado" || a_texto base64 "$rotado" || return 1
             DESCARTADOS=""
             return 0 ;;
     esac
+    [ -s "$destino" ]
 }
 
-avisar_descartados() {
-    if [ -n "$DESCARTADOS" ]; then
-        echo "Aviso: se descartaron ${#DESCARTADOS} caracter(es) iniciales no alineados: '$DESCARTADOS'"
+# Decodifica y exige texto legible, sin tocar $tmp (para mirar una capa más adelante)
+a_texto() {
+    decodificar "$1" "$2" "$tmp_look" && es_texto "$tmp_look"
+}
+
+# ¿Parece UTF-16LE (ej: PowerShell -EncodedCommand)? BOM FF FE o casi todos los bytes impares en cero
+es_utf16le() {
+    [ "$(hex_inicio "$1" 2)" = fffe ] && return 0
+    head -c 400 "$1" | xxd -p -c1 | awk '
+        NR % 2 == 0 { n++; if ($0 != "00") malos++ }
+        NR % 2 == 1 && $0 == "00" { ceros++ }
+        END { exit !(n >= 2 && malos * 10 <= n && ceros * 2 < n) }'
+}
+
+# Convierte el archivo de UTF-16LE a UTF-8 (sin BOM)
+a_utf8() {
+    iconv -f UTF-16LE -t UTF-8 "$1" 2>/dev/null | sed '1s/^\xEF\xBB\xBF//' > "$1.nuevo" && [ -s "$1.nuevo" ] \
+        && mv -- "$1.nuevo" "$1"
+}
+
+# Descomprime el archivo en el lugar: $1 = gzip, zlib o deflate (crudo, el de DeflateStream)
+inflar() {
+    local modo="$1" f="$2"
+    if [ "$modo" = gzip ]; then
+        gzip -dc < "$f" > "$f.nuevo" 2>/dev/null
+    else
+        python3 -I -c 'import sys, zlib
+w = 15 if sys.argv[1] == "zlib" else -15
+sys.stdout.buffer.write(zlib.decompress(sys.stdin.buffer.read(), w))' "$modo" < "$f" > "$f.nuevo" 2>/dev/null
     fi
-    return 0
+    [ $? -eq 0 ] && [ -s "$f.nuevo" ] && mv -- "$f.nuevo" "$f"
 }
 
-# Sigue decodificando $tmp capa por capa mientras dé texto legible; agrega cada formato a CAPAS
-seguir_capas() {
-    local actual tipo
-    while [ "${#CAPAS[@]}" -lt "$MAX_CAPAS" ]; do
-        actual="$(cat "$tmp")"
-        for tipo in "${FORMATOS_CAPAS[@]}"; do
-            DESCARTADOS=""
-            if decodificar "$tipo" "$actual" "$tmp_capa"; then
-                avisar_descartados
-                cp "$tmp_capa" "$tmp"
-                CAPAS+=("$tipo")
-                continue 2
-            fi
-        done
-        break
+# Clave XOR escrita como "35" o "0x23" -> número
+valor_clave() {
+    case "$1" in
+        0x*|0X*) echo $((16#${1:2})) ;;
+        *) echo $((10#$1)) ;;
+    esac
+}
+
+clave_valida() {
+    [[ "$1" =~ ^(0[xX][0-9a-fA-F]{1,2}|[0-9]{1,3})$ ]] && [ "$(valor_clave "$1")" -le 255 ]
+}
+
+# Aplica XOR con una clave de un byte al archivo, en el lugar
+aplicar_xor() {
+    python3 -I -c 'import sys
+k = int(sys.argv[1]); p = sys.argv[2]
+d = open(p, "rb").read()
+open(p, "wb").write(bytes(b ^ k for b in d))' "$(valor_clave "$1")" "$2"
+}
+
+# Después de decodificar: deshace UTF-16LE, compresión y XOR. Las pistas salen del texto de origen
+# ($2): "-bxor 35" da la clave XOR y "DeflateStream" indica deflate crudo. Deja lo aplicado en PASOS.
+posprocesar() {
+    local f="$1" origen="$2" clave deflate=0 i magia
+    PASOS=()
+    clave="$(LC_ALL=C grep -aoiE -- '-bxor[[:space:]]*(0x[0-9a-f]+|[0-9]+)' "$origen" | head -n 1 \
+        | grep -oiE '(0x[0-9a-f]+|[0-9]+)$')"
+    clave_valida "$clave" || clave=""
+    LC_ALL=C grep -aqi 'DeflateStream' "$origen" && deflate=1
+    for i in 1 2 3 4 5 6; do
+        magia="$(hex_inicio "$f" 2)"
+        if [ "$magia" = 1f8b ] && inflar gzip "$f"; then
+            PASOS+=(gzip)
+        elif [[ "$magia" =~ ^78(01|5e|9c|da)$ ]] && inflar zlib "$f"; then
+            PASOS+=(zlib)
+        elif es_texto "$f"; then
+            break
+        elif es_utf16le "$f" && a_utf8 "$f"; then
+            PASOS+=(UTF-16LE)
+        elif [ "$deflate" = 1 ] && inflar deflate "$f"; then
+            deflate=0
+            PASOS+=(deflate)
+        elif [ -n "$clave" ]; then
+            aplicar_xor "$clave" "$f"
+            PASOS+=("XOR $clave")
+            clave=""
+        else
+            break
+        fi
     done
 }
 
-# Decodifica un bloque (primera capa con el formato elegido, o automática) y deja el texto en $tmp
-descifrar_bloque() {
-    local tipo="$1" bloque="$2"
-    CAPAS=()
+# Descripción de la capa recién decodificada: "base64 → gzip"
+describir() {
+    local d="$1" p
+    for p in "${PASOS[@]}"; do d+=" → $p"; done
+    [ -n "$DESCARTADOS" ] && d+=" (se descartaron ${#DESCARTADOS} caracter(es) iniciales no alineados: '$DESCARTADOS')"
+    printf '%s' "$d"
+}
+
+# Intenta decodificar $2 como $1 en $tmp. Modo "texto": solo acepta texto legible.
+# Modo "binario": acepta también binario si se reconoció algo (gzip, XOR...) o si el bloque es largo.
+intentar() {
+    local tipo="$1" bloque="$2" modo="$3" origen="$4"
     DESCARTADOS=""
-    if [ "$tipo" = auto ]; then
-        printf '%s' "$bloque" > "$tmp"
-    else
-        decodificar "$tipo" "$bloque" || return 1
-        avisar_descartados
-        CAPAS=("$tipo")
+    PASOS=()
+    decodificar "$tipo" "$bloque" "$tmp" || return 1
+    posprocesar "$tmp" "$origen"
+    es_texto "$tmp" && return 0
+    [ "$modo" = binario ] && [ "$tipo" != rot13 ] || return 1
+    [ "${#PASOS[@]}" -gt 0 ] || [ "${#bloque}" -ge "$MIN_BINARIO" ]
+}
+
+agregar_capa() {
+    CAPA_DESC+=("$1")
+    CAPA_ARCH+=("$2")
+}
+
+# Descifra una capa más del contenido actual y la agrega como capa nueva
+siguiente_capa() {
+    local actual="${CAPA_ARCH[${#CAPA_ARCH[@]}-1]}" nuevo="$trabajo/capa${#CAPA_ARCH[@]}"
+    local contenido unicas modo tipo bloque desc="" n=0 i
+    local -a bloques partes=()
+
+    if ! es_texto "$actual"; then
+        echo "Error: la capa actual es binaria, no hay texto codificado para seguir. Podés probar XOR (x) o guardarla (g)." >&2
+        return 1
     fi
-    seguir_capas
-    [ "${#CAPAS[@]}" -gt 0 ]
+    # Si el archivo repite la misma línea, se decodifica una sola vez
+    unicas="$(grep -v '^[[:space:]]*$' "$actual" | tr -d '\r' | awk '!visto[$0]++')"
+    if [ "$(printf '%s\n' "$unicas" | wc -l)" -eq 1 ]; then
+        contenido="$unicas"
+    else
+        contenido="$(cat "$actual")"
+    fi
+    # Bloques codificados dentro del texto, sin repetidos y del más largo al más corto
+    mapfile -t bloques < <(LC_ALL=C grep -aoE "[A-Za-z0-9+/]{$MIN_BLOQUE,}={0,6}" "$actual" \
+        | awk '!visto[$0]++ { print length($0) "\t" $0 }' | sort -rn -k1,1 | cut -f2-)
+
+    for modo in texto binario; do
+        # 1) El contenido completo en cada formato
+        for tipo in "${FORMATOS[@]}"; do
+            if intentar "$tipo" "$contenido" "$modo" "$actual"; then
+                cp -- "$tmp" "$nuevo"
+                agregar_capa "$(describir "$tipo")" "$nuevo"
+                return 0
+            fi
+        done
+        # 2) Bloques dentro del texto: en modo texto se juntan todos los mensajes; en binario, el primero
+        for bloque in "${bloques[@]}"; do
+            for tipo in "${FORMATOS_BLOQUES[@]}"; do
+                intentar "$tipo" "$bloque" "$modo" "$actual" || continue
+                n=$((n + 1))
+                cp -- "$tmp" "$trabajo/parte$n"
+                partes+=("$trabajo/parte$n")
+                [ -z "$desc" ] && desc="$(describir "$tipo")"
+                break
+            done
+            [ "$modo" = binario ] && [ "$n" -gt 0 ] && break
+        done
+        [ "$n" -gt 0 ] && break
+    done
+
+    if [ "$n" -eq 0 ]; then
+        echo "Error: no se reconoció ninguna otra capa codificada. Este parece ser el resultado final." >&2
+        return 1
+    fi
+    if [ "$n" -eq 1 ]; then
+        cp -- "${partes[0]}" "$nuevo"
+        agregar_capa "$desc, bloque dentro del texto" "$nuevo"
+    else
+        : > "$nuevo"
+        for i in "${partes[@]}"; do
+            cat -- "$i" >> "$nuevo"
+            [ "$(tail -c 1 -- "$i" | xxd -p)" = 0a ] || echo >> "$nuevo"
+        done
+        agregar_capa "$desc, $n mensajes distintos dentro del texto (uno por línea)" "$nuevo"
+    fi
+}
+
+# Muestra un resultado binario: tipo, primeros bytes y cadenas legibles
+mostrar_binario() {
+    local f="$1" tipo=""
+    command -v file > /dev/null 2>&1 && tipo=" — $(file -b -- "$f")"
+    echo "(Resultado binario: $(wc -c < "$f") bytes$tipo)"
+    echo
+    echo "Primeros 256 bytes:"
+    xxd -l 256 -- "$f"
+    echo
+    echo "Cadenas legibles (6 o más caracteres):"
+    LC_ALL=C grep -aoE '[[:print:]]{6,}' -- "$f" | awk '!visto[$0]++' | head -n 50
 }
 
 # Limpia la pantalla (solo si se está usando en una terminal)
@@ -203,54 +345,97 @@ limpiar() {
     return 0
 }
 
+# Muestra la capa actual y el recorrido hasta ella
+mostrar_capa() {
+    local ult=$(( ${#CAPA_ARCH[@]} - 1 )) f i
+    f="${CAPA_ARCH[ult]}"
+    limpiar
+    echo "===== Archivo: $archivo ====="
+    if [ "$ult" -eq 0 ]; then
+        echo "Capa 0: contenido original"
+    else
+        echo "Capa $ult: ${CAPA_DESC[ult]}"
+    fi
+    echo "----------------------------------------"
+    if es_texto "$f"; then
+        cat -- "$f"
+        [ "$(tail -c 1 -- "$f" | xxd -p)" = 0a ] || echo
+    else
+        mostrar_binario "$f"
+    fi
+    echo "----------------------------------------"
+    if [ "$ult" -gt 0 ]; then
+        echo "Recorrido ($ult capa(s) descifrada(s)):"
+        for ((i = 1; i <= ult; i++)); do echo "  $i. ${CAPA_DESC[i]}"; done
+    fi
+}
+
+xor_manual() {
+    local clave nuevo="$trabajo/capa${#CAPA_ARCH[@]}"
+    read -r -p "Clave XOR de un byte (ej: 35 o 0x23): " clave || exit 0
+    if ! clave_valida "$clave"; then
+        echo "Error: clave inválida (tiene que ser de 0 a 255, en decimal o con 0x)." >&2
+        return 1
+    fi
+    cp -- "${CAPA_ARCH[${#CAPA_ARCH[@]}-1]}" "$nuevo"
+    aplicar_xor "$clave" "$nuevo"
+    DESCARTADOS=""
+    posprocesar "$nuevo" /dev/null
+    agregar_capa "$(describir "XOR $clave (manual)")" "$nuevo"
+}
+
+# Guarda la capa actual junto al archivo original (.bin si es binaria)
+guardar() {
+    local f="${CAPA_ARCH[${#CAPA_ARCH[@]}-1]}" salida r
+    if [ "${#CAPA_ARCH[@]}" -eq 1 ]; then
+        echo "Nada para guardar: estás viendo el contenido original." >&2
+        return
+    fi
+    if es_texto "$f"; then salida="$(nombre_salida)"; else salida="$(nombre_salida bin)"; fi
+    if [ -e "$salida" ]; then
+        read -r -p "'$salida' ya existe. ¿Sobrescribir? [s/N] " r || exit 0
+        [[ "$r" =~ ^[sS]$ ]] || { echo "No se guardó."; return; }
+    fi
+    cp -- "$f" "$salida" && echo "-> Capa $(( ${#CAPA_ARCH[@]} - 1 )) guardada en: $salida"
+}
+
+# Opción "Ejecutar": descifra la primera capa y deja seguir paso a paso
+ejecutar() {
+    local op
+    CAPA_ARCH=("$trabajo/capa0")
+    CAPA_DESC=("contenido original")
+    cp -- "$archivo" "$trabajo/capa0"
+    if ! siguiente_capa; then
+        echo "Petición rechazada para '$archivo'." >&2
+        pausa
+        return
+    fi
+    mostrar_capa
+    while true; do
+        echo
+        echo "d) Desencriptar de nuevo   x) Aplicar XOR   a) Capa anterior   g) Guardar   v) Volver al menú"
+        read -r -p "Opción [d]: " op || exit 0
+        case "$op" in
+            d|D|"") siguiente_capa && mostrar_capa ;;
+            x|X) xor_manual && mostrar_capa ;;
+            a|A)
+                if [ "${#CAPA_ARCH[@]}" -gt 1 ]; then
+                    unset "CAPA_ARCH[${#CAPA_ARCH[@]}-1]" "CAPA_DESC[${#CAPA_DESC[@]}-1]"
+                    mostrar_capa
+                else
+                    echo "Ya estás en el contenido original." >&2
+                fi ;;
+            g|G) guardar ;;
+            v|V) return ;;
+            *) echo "Opción inválida." >&2 ;;
+        esac
+    done
+}
+
 # Espera Enter antes de volver al menú
 pausa() {
     echo
     read -r -p "Presione Enter para volver al menú..." _ || exit 0
-}
-
-procesar() {
-    local tipo="$1" linea bloque salida resultado="" n=0 total=0 cadena m
-    local -A por_formato=()
-    local -a candidatos
-
-    # Quitar repetidos antes de decodificar (orden de aparición)
-    while IFS= read -r linea; do
-        candidatos=("$linea")
-        # En modo automático, si la línea entera no se descifra se prueban sus bloques por separado
-        if [ "$tipo" = auto ] && ! descifrar_bloque auto "$linea" > /dev/null; then
-            mapfile -t candidatos < <(printf '%s\n' "$linea" | grep -oE '[A-Za-z0-9+/]+={0,2}' | awk '!seen[$0]++')
-        fi
-        for bloque in "${candidatos[@]}"; do
-            descifrar_bloque "$tipo" "$bloque" || continue
-            n=$((n + 1))
-            total=$((total + ${#CAPAS[@]}))
-            for m in "${CAPAS[@]}"; do por_formato[$m]=$(( ${por_formato[$m]:-0} + 1 )); done
-            cadena="$(printf '%s → ' "${CAPAS[@]}")"
-            [ "$n" -gt 1 ] && { echo; resultado+=$'\n'; }
-            echo "[Mensaje $n] descifrado ${#CAPAS[@]} vez/veces: ${cadena% → }"
-            printf '%s\n' "$(cat "$tmp")"
-            resultado+="$(cat "$tmp")"$'\n'
-        done
-    done < <(extraer_bloques "$tipo" | awk '!seen[$0]++')
-
-    if [ "$n" -eq 0 ]; then
-        if [ "$tipo" = auto ]; then
-            echo "Error: no se pudo descifrar nada en '$archivo'. Petición rechazada." >&2
-        else
-            echo "Error: no se encontró nada en $tipo en '$archivo'. Petición rechazada." >&2
-        fi
-        return
-    fi
-
-    salida="$(nombre_salida)"
-    printf '%s' "$resultado" > "$salida"
-    echo
-    echo "=== Contador: $total descifrado(s) en total ==="
-    for m in base64 base32 base58 hex rot13; do
-        [ -n "${por_formato[$m]:-}" ] && echo "  $m: ${por_formato[$m]}"
-    done
-    echo "-> $n mensaje(s) únicos guardados en: $salida"
 }
 
 # Archivo inicial: argumento o pregunta
@@ -264,25 +449,15 @@ fi
 while true; do
     limpiar
     echo "===== Archivo: $archivo ====="
-    echo "1) Base64"
-    echo "2) Base32"
-    echo "3) Base58"
-    echo "4) Hexadecimal (base16)"
-    echo "5) ROT13"
-    echo "6) Automático (detecta varias capas)"
-    echo "7) Cambiar archivo"
-    echo "8) Salir"
+    echo "1) Ejecutar"
+    echo "2) Cambiar archivo"
+    echo "3) Salir"
     read -r -p "Opción: " opcion || exit 0
     limpiar
     case "$opcion" in
-        1) procesar base64; pausa ;;
-        2) procesar base32; pausa ;;
-        3) procesar base58; pausa ;;
-        4) procesar hex; pausa ;;
-        5) procesar rot13; pausa ;;
-        6) procesar auto; pausa ;;
-        7) elegir_archivo ;;
-        8) echo "Saliendo."; exit 0 ;;
+        1) ejecutar ;;
+        2) elegir_archivo ;;
+        3) echo "Saliendo."; exit 0 ;;
         *) echo "Opción inválida." >&2; pausa ;;
     esac
 done

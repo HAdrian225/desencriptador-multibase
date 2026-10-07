@@ -3,11 +3,12 @@
 ## Requisitos
 
 - Linux (probado en Ubuntu) con **bash** 4 o superior.
-- Programas: `base64`, `base32`, `xxd`, `bc`, `iconv`, `grep`, `awk`, `sed`, `tr`.
+- Programas: `base64`, `base32`, `xxd`, `bc`, `iconv`, `grep`, `awk`, `sed`, `tr`, `gzip` y `python3`
+  (este último para zlib/deflate y XOR). `file` es opcional: si está, describe los resultados binarios.
   Casi todos vienen instalados. Si falta alguno:
 
   ```bash
-  sudo apt install coreutils xxd bc
+  sudo apt install coreutils xxd bc gzip python3
   ```
 
 Funciona desde cualquier terminal (kitty, GNOME Terminal, etc.) con zsh o bash.

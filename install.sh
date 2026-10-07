@@ -14,12 +14,12 @@ fi
 
 # Verificar dependencias
 faltan=()
-for cmd in base64 base32 xxd bc iconv grep awk tr sed; do
+for cmd in base64 base32 xxd bc iconv grep awk tr sed gzip python3; do
     command -v "$cmd" > /dev/null 2>&1 || faltan+=("$cmd")
 done
 if [ "${#faltan[@]}" -gt 0 ]; then
     echo "Error: faltan estos programas: ${faltan[*]}" >&2
-    echo "En Debian/Ubuntu: sudo apt install coreutils xxd bc" >&2
+    echo "En Debian/Ubuntu: sudo apt install coreutils xxd bc gzip python3" >&2
     exit 1
 fi
 
