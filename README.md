@@ -18,7 +18,9 @@ Reconoce:
 | XOR de un byte | automático si el texto indica la clave (`-bxor 35`), o manual con la clave que elijas |
 
 Los resultados binarios (por ejemplo shellcode) se muestran como volcado hexadecimal con sus cadenas
-legibles y se pueden guardar como `.bin`. **El programa nunca ejecuta lo que decodifica.**
+legibles. Todo se guarda siempre como `.txt`: un binario se guarda como volcado hexadecimal (del que
+se pueden recuperar los bytes). Si el archivo es un hash (MD5, SHA-1, SHA-256...), avisa que no se
+puede desencriptar y permite **crackearlo con un diccionario**. **El programa nunca ejecuta lo que decodifica.**
 
 ## Inicio rápido
 

@@ -17,6 +17,10 @@ FORMATOS_BLOQUES=(hex base32 base64)
 MIN_BLOQUE=16
 # Un bloque que da binario solo se acepta si es así de largo (si no, suele ser una palabra cualquiera)
 MIN_BINARIO=64
+# Largos de hash en hexadecimal: no son texto cifrado, decodificarlos solo da bytes aleatorios
+declare -A HASHES=([32]="MD5 o NTLM" [40]="SHA-1" [56]="SHA-224" [64]="SHA-256" [96]="SHA-384" [128]="SHA-512")
+# Diccionarios que se buscan si no se indica uno al crackear un hash
+DICCIONARIOS=(/usr/share/wordlists/rockyou.txt "$HOME/wordlists/rockyou.txt" /usr/share/john/password.lst)
 
 archivo=""
 trabajo="$(mktemp -d)"
@@ -264,10 +268,97 @@ agregar_capa() {
     CAPA_ARCH+=("$2")
 }
 
+# Si el archivo es solo un hash en hexadecimal, deja el tipo en HASH_TIPO y el valor en HASH_VALOR
+detectar_hash() {
+    HASH_VALOR="$(tr -d '[:space:]' < "$1")"
+    HASH_TIPO=""
+    [[ "$HASH_VALOR" =~ ^[0-9a-fA-F]+$ ]] && HASH_TIPO="${HASHES[${#HASH_VALOR}]:-}"
+    [ -n "$HASH_TIPO" ]
+}
+
+# Ataque de diccionario contra el hash de la capa actual: prueba cada palabra con los algoritmos
+# de ese largo (MD5/NTLM, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512) y agrega la palabra como capa nueva
+crackear() {
+    local actual="${CAPA_ARCH[${#CAPA_ARCH[@]}-1]}" nuevo="$trabajo/capa${#CAPA_ARCH[@]}" dic="" d r
+    if ! detectar_hash "$actual"; then
+        echo "Error: la capa actual no es un hash (MD5, SHA-1, SHA-224, SHA-256, SHA-384 o SHA-512)." >&2
+        return 1
+    fi
+    for d in "${DICCIONARIOS[@]}"; do
+        [ -f "$d" ] && { dic="$d"; break; }
+    done
+    echo "Hash $HASH_TIPO: $HASH_VALOR"
+    if [ -n "$dic" ]; then
+        read -r -e -p "Diccionario o palabra a probar [$dic]: " r || exit 0
+    else
+        read -r -e -p "Diccionario (un archivo con una palabra por línea) o palabra a probar: " r || exit 0
+    fi
+    r="${r%\"}"; r="${r#\"}"; r="${r%\'}"; r="${r#\'}"
+    [[ "$r" == "~/"* ]] && r="$HOME/${r:2}"
+    [ -n "$r" ] && dic="$r"
+    if [ -z "$dic" ]; then
+        echo "Error: no se indicó diccionario." >&2
+        return 1
+    fi
+    [ -f "$dic" ] && echo "Probando con '$dic' (Ctrl+C para cancelar)..."
+    # Ctrl+C corta solo el ataque, no el programa
+    trap 'true' INT
+    python3 -I -c '
+import hashlib, sys, time
+objetivo, ruta, salida = sys.argv[1].lower(), sys.argv[2], sys.argv[3]
+algoritmos = {32: ["md5", "ntlm"], 40: ["sha1"], 56: ["sha224", "sha3_224"], 64: ["sha256", "sha3_256"],
+              96: ["sha384", "sha3_384"], 128: ["sha512", "sha3_512"]}[len(objetivo)]
+def funcion(nombre):
+    if nombre == "ntlm":
+        try:
+            hashlib.new("md4")
+        except ValueError:
+            return None
+        return lambda p: hashlib.new("md4", p.decode("utf-8", "replace").encode("utf-16-le")).hexdigest()
+    return lambda p, n=nombre: hashlib.new(n, p).hexdigest()
+def bonito(nombre):
+    return {"md5": "MD5", "ntlm": "NTLM"}.get(nombre) or nombre.upper().replace("SHA3_", "SHA3-").replace("SHA", "SHA-", 1).replace("SHA-3-", "SHA3-")
+pruebas = [(n, f) for n in algoritmos if (f := funcion(n))]
+def palabras():
+    try:
+        with open(ruta, "rb") as d:
+            for linea in d:
+                yield linea.rstrip(b"\r\n")
+    except (FileNotFoundError, IsADirectoryError):
+        yield ruta.encode()
+n, inicio = 0, time.time()
+try:
+    for p in palabras():
+        n += 1
+        for nombre, f in pruebas:
+            if f(p) == objetivo:
+                alg = bonito(nombre)
+                texto = p.decode("utf-8", "replace")
+                open(salida, "wb").write(p + b"\n")
+                open(salida + ".alg", "w").write(alg)
+                print(f"Encontrado con {alg} tras {n} palabra(s): {texto}")
+                sys.exit(0)
+        if n % 1000000 == 0:
+            print(f"  {n:,} palabras probadas ({n / (time.time() - inicio):,.0f}/s)...", file=sys.stderr)
+except KeyboardInterrupt:
+    print(f"Cancelado tras {n:,} palabra(s).", file=sys.stderr)
+    sys.exit(130)
+usados = ", ".join(bonito(x) for x, _ in pruebas)
+print(f"No se encontró: se probaron {n:,} palabra(s) con {usados}.", file=sys.stderr)
+sys.exit(1)
+' "$HASH_VALOR" "$dic" "$nuevo"
+    r=$?
+    trap - INT
+    [ "$r" -eq 0 ] || return 1
+    if [ -f "$dic" ]; then d="diccionario $(basename -- "$dic")"; else d="la palabra indicada"; fi
+    agregar_capa "$(cat "$nuevo.alg") crackeado con $d" "$nuevo"
+    rm -f -- "$nuevo.alg"
+}
+
 # Descifra una capa más del contenido actual y la agrega como capa nueva
 siguiente_capa() {
     local actual="${CAPA_ARCH[${#CAPA_ARCH[@]}-1]}" nuevo="$trabajo/capa${#CAPA_ARCH[@]}"
-    local contenido unicas modo tipo bloque desc="" n=0 i
+    local contenido unicas modo tipo bloque desc="" n=0 i hash=""
     local -a bloques partes=()
 
     if ! es_texto "$actual"; then
@@ -281,11 +372,14 @@ siguiente_capa() {
     else
         contenido="$(cat "$actual")"
     fi
+    [[ "$contenido" =~ ^[0-9a-fA-F]+$ ]] && hash="${HASHES[${#contenido}]:-}"
     # Bloques codificados dentro del texto, sin repetidos y del más largo al más corto
     mapfile -t bloques < <(LC_ALL=C grep -aoE "[A-Za-z0-9+/]{$MIN_BLOQUE,}={0,6}" "$actual" \
         | awk '!visto[$0]++ { print length($0) "\t" $0 }' | sort -rn -k1,1 | cut -f2-)
 
     for modo in texto binario; do
+        # Un hash solo se acepta si da texto legible (casi nunca): no tiene sentido pasarlo a bytes
+        [ "$modo" = binario ] && [ -n "$hash" ] && break
         # 1) El contenido completo en cada formato
         for tipo in "${FORMATOS[@]}"; do
             if intentar "$tipo" "$contenido" "$modo" "$actual"; then
@@ -309,7 +403,11 @@ siguiente_capa() {
         [ "$n" -gt 0 ] && break
     done
 
-    if [ "$n" -eq 0 ]; then
+    if [ "$n" -eq 0 ] && [ -n "$hash" ]; then
+        echo "Error: parece un hash $hash (${#contenido} caracteres hexadecimales), no un texto cifrado." >&2
+        echo "Un hash no se puede desencriptar: solo se puede crackear con un diccionario (opción c)." >&2
+        return 1
+    elif [ "$n" -eq 0 ]; then
         echo "Error: no se reconoció ninguna otra capa codificada. Este parece ser el resultado final." >&2
         return 1
     fi
@@ -337,6 +435,24 @@ mostrar_binario() {
     echo
     echo "Cadenas legibles (6 o más caracteres):"
     LC_ALL=C grep -aoE '[[:print:]]{6,}' -- "$f" | awk '!visto[$0]++' | head -n 50
+}
+
+# Versión en texto de una capa binaria, para guardarla como .txt: volcado hexadecimal completo y cadenas
+volcado_binario() {
+    local f="$1" salida="$2" tipo=""
+    command -v file > /dev/null 2>&1 && tipo=" — $(file -b -- "$f")"
+    {
+        echo "# Capa $(( ${#CAPA_ARCH[@]} - 1 )): ${CAPA_DESC[${#CAPA_DESC[@]}-1]}"
+        echo "# Resultado binario: $(wc -c < "$f") bytes$tipo"
+        echo "# Para recuperar los bytes originales:"
+        echo "#   grep -E '^[0-9a-f]{8}:' \"$(basename -- "$salida")\" | xxd -r > capa.bin"
+        echo
+        echo "## Volcado hexadecimal"
+        xxd -- "$f"
+        echo
+        echo "## Cadenas legibles (6 o más caracteres)"
+        LC_ALL=C grep -aoE '[[:print:]]{6,}' -- "$f" | awk '!visto[$0]++'
+    } > "$salida"
 }
 
 # Limpia la pantalla (solo si se está usando en una terminal)
@@ -384,19 +500,26 @@ xor_manual() {
     agregar_capa "$(describir "XOR $clave (manual)")" "$nuevo"
 }
 
-# Guarda la capa actual junto al archivo original (.bin si es binaria)
+# Guarda la capa actual junto al archivo original, siempre como .txt
+# (si es binaria, se guarda el volcado hexadecimal y las cadenas legibles)
 guardar() {
     local f="${CAPA_ARCH[${#CAPA_ARCH[@]}-1]}" salida r
     if [ "${#CAPA_ARCH[@]}" -eq 1 ]; then
         echo "Nada para guardar: estás viendo el contenido original." >&2
         return
     fi
-    if es_texto "$f"; then salida="$(nombre_salida)"; else salida="$(nombre_salida bin)"; fi
+    salida="$(nombre_salida txt)"
     if [ -e "$salida" ]; then
         read -r -p "'$salida' ya existe. ¿Sobrescribir? [s/N] " r || exit 0
         [[ "$r" =~ ^[sS]$ ]] || { echo "No se guardó."; return; }
     fi
-    cp -- "$f" "$salida" && echo "-> Capa $(( ${#CAPA_ARCH[@]} - 1 )) guardada en: $salida"
+    if es_texto "$f"; then
+        cp -- "$f" "$salida" || return
+        echo "-> Capa $(( ${#CAPA_ARCH[@]} - 1 )) guardada en: $salida"
+    else
+        volcado_binario "$f" "$salida" || return
+        echo "-> Capa $(( ${#CAPA_ARCH[@]} - 1 )) (binaria) guardada como volcado hexadecimal en: $salida"
+    fi
 }
 
 # Opción "Ejecutar": descifra la primera capa y deja seguir paso a paso
@@ -405,19 +528,25 @@ ejecutar() {
     CAPA_ARCH=("$trabajo/capa0")
     CAPA_DESC=("contenido original")
     cp -- "$archivo" "$trabajo/capa0"
-    if ! siguiente_capa; then
+    if siguiente_capa; then
+        mostrar_capa
+    elif detectar_hash "$trabajo/capa0"; then
+        # Un hash no se desencripta, pero se puede crackear: se queda en la capa 0 para elegir "c"
+        echo
+        echo "Capa 0: hash $HASH_TIPO"
+    else
         echo "Petición rechazada para '$archivo'." >&2
         pausa
         return
     fi
-    mostrar_capa
     while true; do
         echo
-        echo "d) Desencriptar de nuevo   x) Aplicar XOR   a) Capa anterior   g) Guardar   v) Volver al menú"
+        echo "d) Desencriptar de nuevo   x) Aplicar XOR   c) Crackear hash   a) Capa anterior   g) Guardar   v) Volver al menú"
         read -r -p "Opción [d]: " op || exit 0
         case "$op" in
             d|D|"") siguiente_capa && mostrar_capa ;;
             x|X) xor_manual && mostrar_capa ;;
+            c|C) crackear && mostrar_capa ;;
             a|A)
                 if [ "${#CAPA_ARCH[@]}" -gt 1 ]; then
                     unset "CAPA_ARCH[${#CAPA_ARCH[@]}-1]" "CAPA_DESC[${#CAPA_DESC[@]}-1]"
